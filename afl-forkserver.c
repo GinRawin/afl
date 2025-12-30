@@ -51,6 +51,7 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <jansson.h>
 
 // for pwait
 #include <sys/capability.h>
@@ -1338,57 +1339,10 @@ void monitor_process(pid_t pid) {
 }
 
 
-void kill_process_tree(pid_t pid) {
-    DIR* dir;
-    struct dirent* entry;
-    char path[256];
-    
-    // 首先查找并杀死所有子进程
-    if ((dir = opendir("/proc")) != NULL) {
-        while ((entry = readdir(dir)) != NULL) {
-            // 检查是否是进程目录（只包含数字）
-            if (entry->d_type == DT_DIR && isdigit(entry->d_name[0])) {
-                char stat_path[256];
-                FILE* fp;
-                int ppid;
-                
-                snprintf(stat_path, sizeof(stat_path), "/proc/%s/stat", entry->d_name);
-                fp = fopen(stat_path, "r");
-                if (fp != NULL) {
-                    // 读取父进程ID
-                    fscanf(fp, "%*d %*s %*c %d", &ppid);
-                    fclose(fp);
-                    
-                    // 如果父进程ID等于当前要杀的进程
-                    if (ppid == pid) {
-                        pid_t child_pid = atoi(entry->d_name);
-                        printf("Found child process: %d of parent %d\n", child_pid, pid);
-                        kill_process_tree(child_pid);  // 递归杀死子进程的子进程
-                    }
-                }
-            }
-        }
-        closedir(dir);
-    }
-    
-    // 杀死当前进程
-    printf("Killing process: %d\n", pid);
-    // kill(pid, SIGKILL);  // 使用 SIGTERM 更温和，SIGKILL 强制杀死
-}
+
 void kill_all_child(struct pid_fd** pid_fd_list)
 {
   for(int i = 0; pid_fd_list[i] != NULL; i++){
-    printf("child pid:%d\n",pid_fd_list[i]->pid);
-    printf("its active:%d\n",pid_fd_list[i]->active);
-    kill_process_tree(pid_fd_list[i]->pid);
-    // 检查进程是否真的存在
-    if(pid_fd_list[i]->active == 0){
-      pid_t pid = pid_fd_list[i]->pid;
-      int process_exists = (kill(pid, 0) == 0);  // 发送信号0检查进程存在性
-      if (process_exists) {
-          printf("  警告：进程存在但active=0！可能有逻辑错误\n");
-      } 
-    }
     if(pid_fd_list[i]->active > 0){
       printf("kill utility child: %d\n", pid_fd_list[i]->pid);
       int kill_ret = kill(pid_fd_list[i]->pid, SIGKILL);
@@ -1398,7 +1352,7 @@ void kill_all_child(struct pid_fd** pid_fd_list)
         fclose(fp_kill);
       }
       else{
-        printf("kill success with return value %d\n", kill_ret);
+        printf("kill success with return value %d", kill_ret);
         monitor_process(pid_fd_list[i]->pid);
       }
       pid_fd_list[i]->active = 0;
@@ -1414,12 +1368,23 @@ void kill_all_child(struct pid_fd** pid_fd_list)
 
 
 static u32 __attribute__((hot))
-read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms, volatile u8 *stop_soon_p) {
+read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms, volatile u8 *stop_soon_p, json_t* json_input, afl_state_t *afl) {
 
   memset(wait_pid_list, -1, MAX_PROC_CNT*sizeof(int));
   if(pid_fd_list == NULL){
     pid_fd_list = (struct pid_fd**)malloc(0x30 * sizeof(struct pid_fd*));
   }
+
+//   int json_type;
+//   char* json_type_str = json_string_value(json_object_get(json_input, "type"));
+// // printf("[-----------------json type] %s\n", json_type_str);
+//   if(strcmp(json_type_str, "JSON") == 0){
+//   // printf("[-----------------json type] is json\n");
+//     json_type = SEED_TYPE_JSON;
+//   }else{
+//   // printf("[-----------------json type] is raw\n");
+//     json_type = SEED_TYPE_RAW;
+//   }
 
   // const struct timespec tv_nonblock = {0, 5000};
   // struct timeval timeout;
@@ -1447,7 +1412,7 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
   my_global_afl->utility_timeout = 0;
 
   
-
+  bool after_close = FALSE;
   // timeout.tv_sec = 0;
   // timeout.tv_usec = 5000;
   
@@ -1467,6 +1432,14 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
   memset(pid_fd_list, 0, 0x30*sizeof(struct pid_fd*));
   max_fd = pipe_fd > domain_fd ? pipe_fd : domain_fd;
 
+  //lbw: add remain packet number
+  // json_t* root = afl
+  // int remain_packet_num = json_integer_value(json_object_get(json_input, "packet_num")) - 1;
+  // timeout_ms = json_integer_value(json_object_get(json_input, "packet_num")) * timeout_ms;
+  // int current_packet_index = 1;
+  // bool wait_for_close = false;
+
+
   // int n_deal = 0;
   // int n_poll = 0;
   // long long all_elapsed = 0;
@@ -1481,8 +1454,8 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
 
     }
     gettimeofday(&tv_now, NULL);
-    double duration = 1000 * (tv_now.tv_sec - tv_begin.tv_sec) + ((tv_now.tv_usec - tv_begin.tv_usec) / 1000.0);
-    printf("before duration > timeout_ms in afl-forkserver\n");
+    u32 duration = ((u32)(get_cur_time_us()) - read_start) / 1000;
+    // double duration = 1000 * (tv_now.tv_sec - tv_begin.tv_sec) + ((tv_now.tv_usec - tv_begin.tv_usec) / 1000.0);
     if(duration > timeout_ms){
       // 主进程超时，但是一般主进程超时，子进程肯定也会超时
       printf("timeout, afl_len_read = %d, main_bin_exit=%d\n", afl_len_read, main_bin_exit);
@@ -1504,9 +1477,9 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
         }
       }
       */
-      printf("kill all child!\n");
       kill_all_child(pid_fd_list);
       destroy_list(pid_fd_list);
+      return timeout_ms + 1;
       ready_to_quit = 1;
       // 清空fd_list
       // BUG: 注意这里不能直接清空fd_list，否则碰到已经建立连接请求，并且在等待连接的，就会一直等下去
@@ -1533,6 +1506,7 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
     if(main_bin_exit == 1 && has_unexited_child == 0){
       // printf("[exit] n_deal: %d; n_poll: %d, all_poll_elapsed: %lld\n", n_deal, n_poll, all_elapsed);
       // 此时可以退出并写入状态.此时主进程一定超时或者退出
+      printf("main_bin_exit = 1 but has no unexited_child, returning\n");
       destroy_list(pid_fd_list);
       // TODO: close all accepted socket, and clear domain_fd
       for(int i = 0; i < max_client; i ++){
@@ -1541,7 +1515,9 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
           close(fd_list[i]);
         }
       }
-      u32 exec_ms = MIN(timeout_ms, (get_cur_time_us() - read_start) / 1000);
+      u32 exec_ms = MIN(timeout_ms, ((u32)(get_cur_time_us()) - read_start) / 1000);
+    // printf("[--------------------main_bin_exit == 1, exiting], exitint_time: %d\n", exec_ms);
+    // printf("[--------------------main_bin_exit == 1, exiting], exec_time: %d\n", (((u32)(get_cur_time_us()) - read_start) / 1000));
       return exec_ms > 0 ? exec_ms : 1;
     }
     
@@ -1595,7 +1571,9 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
     // n_poll++;
     // struct timespec ts1, ts2;
     // clock_gettime(CLOCK_MONOTONIC, &ts1);
+    // printf("-----------------before check poll\n");
     sret = poll(poll_fds, poll_fds_cnt, duration < timeout_ms ? timeout_ms - duration : 80);
+    // printf("-----------------after check poll\n");
     // clock_gettime(CLOCK_MONOTONIC, &ts2);
     // long long elapsed = (long long) (ts2.tv_sec - ts1.tv_sec) * 1000000000ll+ ts2.tv_nsec - ts1.tv_nsec;
     // all_elapsed += elapsed;
@@ -1607,6 +1585,8 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
     if(sret < 0){
       printf("sret < 0\n");
       if(errno == EINTR){
+        printf("check poll ret < 0 \n");
+
         continue; // while(1) loop
       }else{
         // 出错
@@ -1621,6 +1601,7 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
       // 这里为什么要清除：有一个条件竞争：超时的时候产生了连接请求(例如主进程fork)，然而超时之后因为判定是主进程超时，只会kill主进程，但是fork产生的进程还没有关闭pipe，所以forkserver认为进程还没有结束，外面的read也就不会返回
       kill_all_child(pid_fd_list);
       destroy_list(pid_fd_list);
+      printf("[read_s32_timed_multiprocess] timeoput\n");
       return timeout_ms + 1;
     }
 
@@ -1629,20 +1610,28 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
         // 有可读数据，可能是进程对应的fd结束，或者有新的socket连接, 或者是afl对应的pipe fd结束
         // 如果ready_to_quit
         if(poll_fds[i].fd == pipe_fd){
-          // AFL结束
-          do{
-            afl_len_read = read(pipe_fd, (u8 *)buf, 4);
-          }
-          while(afl_len_read == -1 && errno == EINTR);
-          if (unlikely(afl_len_read < 4 && afl_len_read >= 0)) {
-            // TODO: 处理错误
-            FILE* fp = fopen("afl_error.log", "a+");
-            fprintf(fp, "afl_len_read < 4\n");
-            fclose(fp);
-          }
-          main_bin_exit = 1;
-          // printf("read from pipe_fd, length=%d\n", afl_len_read);
+            printf("check poll pipe finish");
+            main_bin_exit = 1;
         }
+        //   // AFL结束
+        //   do{
+        //     afl_len_read = read(pipe_fd, (u8 *)buf, 4);
+        //   }
+        //   while(afl_len_read == -1 && errno == EINTR);
+        //   if (unlikely(afl_len_read < 4 && afl_len_read >= 0)) {
+        //     // TODO: 处理错误
+        //     FILE* fp = fopen("afl_error.log", "a+");
+        //     fprintf(fp, "afl_len_read < 4\n");
+        //     fclose(fp);
+        //   }
+        // }
+          // lbw: 如果没有数据包了，那就可以退出
+          // main_bin_exit = 1;
+          // if(remain_packet_num == 0){
+          //   printf("sending packet finish\n");
+          //   main_bin_exit = 1;
+          // }
+          // printf("read from pipe_fd, length=%d\n", afl_len_read);
         if(poll_fds[i].fd == domain_fd){
           // 有新的进程连接
           new_sock = accept(domain_fd, (struct sockaddr *)&client_addr, (socklen_t*)&addrlen);
@@ -1655,8 +1644,49 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
             }
             memset(client_buf, 0, 0x50);
             ret = recv(new_sock, client_buf, 0x30, 0);
+
+            // 打印从被测进程接收到的消息，如果是123就说明是当前数据包处理完毕，那么开始发送下个数据包
             if(ret > 0 && ret <= 0x30){
               memset(&client_buf[ret], '\0', 1);
+            // printf("[-----------------sending packet] get msg %s\n", client_buf);
+            }
+            // if((ret == 3) && (strncmp("11", client_buf, 2) == 0)){
+            //   int current_packet_index = (int)(client_buf[2] - '0');
+            //   char packet_name[10];
+            //   sprintf(packet_name, "packet_%d", current_packet_index);
+            // printf("[-----------------sending packet] %s\n", packet_name);
+            // // printf("[-----------------remain_packet_num] %d\n", remain_packet_num);
+            //   u8 *use_mem;
+            //   int packet_length = 0;
+            //   // if(remain_packet_num > 0){
+            //     // lbw: 根据种子类型读取数据包并且写入
+            //   // printf("[-----------------11111111111\n");
+            //     if(json_type == SEED_TYPE_JSON){
+            //     // printf("[-----------------22222222222\n");
+            //       use_mem = json_to_http(json_object_get(json_input, packet_name), &packet_length);
+            //     // printf("[-----------------44444444444\n");
+            //       packet_length = strlen(use_mem);
+            //     }else{
+            //     // printf("[-----------------33333333333\n");
+            //       use_mem = json_string_value(json_object_get(json_input, packet_name));
+            //     // printf("[-----------------55555555555\n");
+            //       packet_length = strlen(use_mem);
+            //     }
+            //   printf("[-----------------sending packet len before write_to_testcase] %d\n", packet_length);
+            //     int len = write_to_testcase(afl, (void **)&use_mem, packet_length, 1);
+            //   printf("[-----------------sending packet len after write_to_testcase] %d\n", packet_length);
+            //     remain_packet_num = remain_packet_num - 1;
+            //     if(json_type == SEED_TYPE_JSON){
+            //       free(use_mem);
+            //     }
+            //   // }
+            // }
+            if((ret == 3) && (strncmp("124", client_buf, 3) == 0)){
+              main_bin_exit = 1;
+            }
+            if(ret > 0 && ret <= 0x30){
+              memset(&client_buf[ret], '\0', 1);
+              printf("[deal_with_buf]: %s\n", client_buf);
               deal_with_buf(client_buf, new_sock, pid_fd_list);
             }
             close(new_sock);
@@ -1670,6 +1700,7 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
       if((poll_fds[i].revents & POLLRDHUP) || poll_fds[i].revents & POLLERR)
       {
         // 关闭了连接，可能是utility进程的socket关闭
+        printf("[closing message] \n");
         for(int fd_index = 0; fd_index < max_client; fd_index++){
           if(poll_fds[i].fd == fd_list[fd_index]){
             close(fd_list[fd_index]);
@@ -1774,7 +1805,6 @@ read_s32_timed_multiprocess(s32 pipe_fd, s32 domain_fd, s32 *buf, u32 timeout_ms
   It execvs for each fork, forwarding exit codes and child pids to afl. */
 
 static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
-  printf("Forkserver PID: %d\n", getpid());  // 就加这一
 
   unsigned char tmp[4] = {0, 0, 0, 0};
   pid_t         child_pid;
@@ -1785,7 +1815,7 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
      assume we're not running in forkserver mode and just execute program. */
 
   if (write(FORKSRV_FD + 1, tmp, 4) != 4) {
-    printf("in abort\n");
+
     abort();  // TODO: Abort?
 
   }
@@ -1793,6 +1823,7 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
   void (*old_sigchld_handler)(int) = signal(SIGCHLD, SIG_DFL);
 
   while (1) {
+
     uint32_t was_killed;
     int      status;
 
@@ -1803,7 +1834,6 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
     /* Create a clone of our process. */
 
     child_pid = fork();
-    printf("afl-forkserver.c: fork a child process in afl-forkserver:%d\n",child_pid);
 
     if (child_pid < 0) { PFATAL("Fork failed"); }
 
@@ -2199,7 +2229,6 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
   fsrv->last_run_timed_out = 0;
   fsrv->fsrv_pid = fork();
-  printf("afl-forkserver.c:fsrv->fsrv_pid:%d\n",fsrv->fsrv_pid);
 
   if (fsrv->fsrv_pid < 0) { PFATAL("fork() failed"); }
 
@@ -2560,7 +2589,7 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
       }
 
-      // printf("[afl-forkserver, reach 1]\n");
+    // printf("[afl-forkserver, reach 1]\n");
 
       if ((status & FS_OPT_AUTODICT) == FS_OPT_AUTODICT) {
 
@@ -2922,6 +2951,80 @@ u32 afl_fsrv_get_mapsize(afl_forkserver_t *fsrv, char **argv,
 void __attribute__((hot))
 afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
 
+  if (likely(fsrv->use_shmem_fuzz)) {
+
+    if (unlikely(len > MAX_FILE)) len = MAX_FILE;
+
+    *fsrv->shmem_fuzz_len = len;
+    memcpy(fsrv->shmem_fuzz, buf, len);
+#ifdef _DEBUG
+    if (getenv("AFL_DEBUG")) {
+
+      fprintf(stderr, "FS crc: %016llx len: %u\n",
+              hash64(fsrv->shmem_fuzz, *fsrv->shmem_fuzz_len, HASH_CONST),
+              *fsrv->shmem_fuzz_len);
+      fprintf(stderr, "SHM :");
+      for (u32 i = 0; i < *fsrv->shmem_fuzz_len; i++)
+        fprintf(stderr, "%02x", fsrv->shmem_fuzz[i]);
+      fprintf(stderr, "\nORIG:");
+      for (u32 i = 0; i < *fsrv->shmem_fuzz_len; i++)
+        fprintf(stderr, "%02x", buf[i]);
+      fprintf(stderr, "\n");
+
+    }
+
+#endif
+
+  } else {
+
+    int shm_fd;
+    char *shm_ptr;
+
+    const char *shm_name = "/fuzz_seed";
+
+    // 打开共享内存
+    shm_fd = shm_open(shm_name, O_RDWR | O_CREAT, 0666);
+    if (shm_fd == -1) {
+      perror("shm_open");
+      FATAL("Unable to open shared memory");
+    }
+
+    // 设置共享内存大小
+    if (ftruncate(shm_fd, len) == -1) {
+      perror("ftruncate");
+      FATAL("Unable to set shared memory size");
+    }
+
+    // 映射共享内存
+    shm_ptr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_ptr == MAP_FAILED) {
+      perror("mmap");
+      FATAL("Unable to map shared memory");
+    }
+
+    // 写入数据
+    memcpy(shm_ptr, buf, len);
+
+    // 取消映射
+    if (munmap(shm_ptr, len) == -1) {
+      perror("munmap");
+      FATAL("Unable to unmap shared memory");
+    }
+
+    // 关闭共享内存
+    if (close(shm_fd) == -1) {
+      perror("close");
+      FATAL("Unable to close shared memory");
+    }
+  }
+
+}
+
+
+
+void __attribute__((hot))
+afl_fsrv_write_to_testcase_bk(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
+
 #ifdef __linux__
   if (unlikely(fsrv->nyx_mode)) {
 
@@ -3017,7 +3120,7 @@ afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
 
     }
 
-    // fprintf(stderr, "WRITE %d %u\n", fd, len);
+    fprintf(stderr, "[alf_fsrv_write_to_testcase] WRITE %d %u\n", fd, len);
     ck_write(fd, buf, len, fsrv->out_file);
 
     if (fsrv->use_stdin) {
@@ -3039,16 +3142,20 @@ afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
    information. The called program will update afl->fsrv->trace_bits. */
 // extern afl_state_t *my_global_afl;
 
-
+//这个函数只在fuzz_run_target这个函数调用
 fsrv_run_result_t __attribute__((hot))
-afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
-                    volatile u8 *stop_soon_p) {
+  afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
+                    volatile u8 *stop_soon_p, json_t* json_input) {
 
   s32 res;
   u32 exec_ms;
-  u32 write_value = fsrv->last_run_timed_out;
+  u32 write_value;
+  write_value = fsrv->last_run_timed_out;
+  // write_value[1] = json_integer_value(json_object_get(json_input, "packet_num"));//leishen
   // u32 child_tmout = 0;
 
+
+printf("[afl_fsrv_run_target] entering\n");
 #ifdef __linux__
   if (fsrv->nyx_mode) {
 
@@ -3136,7 +3243,7 @@ afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
 
   fsrv->last_run_timed_out = 0;
 
-  // printf("[afl_fsrv_run_target] before read1\n");
+// printf("[afl_fsrv_run_target] before read1\n");
 
   if ((res = read(fsrv->fsrv_st_fd, &fsrv->child_pid, 4)) != 4) {
     // 应该是只有一个新进程产生，这里是qemuafl fork出来并告知forkserver的
@@ -3179,19 +3286,18 @@ afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
       FATAL(
           "Target reported shared memory access failed (perhaps increase "
           "shared memory available).");
-
+    printf("fsrv->child_pid = %d\n", fsrv->child_pid);
     FATAL("Fork server is misbehaving (OOM?)");
 
   }
 
   // printf("fd:%d, tmout:%d",fsrv->fsrv_st_fd,timeout);  
-  // printf("[afl_fsrv_run_target] before read_s32_timed, fd=%d, tmout=%d\n", fsrv->fsrv_st_fd,timeout);
+// printf("[afl_fsrv_run_target] before read_s32_timed, fd=%d, tmout=%d\n", fsrv->fsrv_st_fd,timeout);
   // 这里等待一定时间的同时，也是等待目标进程(主进程)的结束
   // FILE* fp_crash = fopen("crash_info.txt", "a+");
   
   // fprintf(fp_crash, "[before read_s32_mp] exec: %lld, meets_bug: %d, meets_cmdinj=%d, child_status: %d\n", fsrv->total_execs, my_global_afl->meets_bug, my_global_afl->meets_cmdinj, fsrv->child_status);
-  printf("before read s32 timed multiprocess in afl-forkserver\n");
-  exec_ms = read_s32_timed_multiprocess(fsrv->fsrv_st_fd, fsrv->domain_fd, &fsrv->child_status, timeout, stop_soon_p);
+  exec_ms = read_s32_timed_multiprocess(fsrv->fsrv_st_fd, fsrv->domain_fd, &fsrv->child_status, timeout, stop_soon_p, json_input, my_global_afl);
 
   // fprintf(fp_crash, "[after read_s32_mp] exec: %lld, meets_bug: %d, meets_cmdinj=%d, child_status: %d, is_crash: %d\n", fsrv->total_execs, my_global_afl->meets_bug, my_global_afl->meets_cmdinj, fsrv->child_status, WIFSIGNALED(fsrv->child_status) ? WTERMSIG(fsrv->child_status) : 0);
   // fclose(fp_crash);
@@ -3231,31 +3337,43 @@ afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
   
   
   // exec_ms = read_s32_timed(fsrv->fsrv_st_fd, &fsrv->child_status, timeout, stop_soon_p);
+// printf("[afl_fsrv_run_target] before read child_status\n");
+  // int read_len = read(fsrv->fsrv_st_fd, &fsrv->child_status, 4);
+
   
+// printf("[afl_fsrv_run_target] after read child_status\n");
   if (exec_ms > timeout && my_global_afl->utility_timeout == 0) {
+    printf("--------------------------------------------------------------------------------------[afl_fsrv_run_target] timeout\n");
+    // exit(0);
 
     /* If there was no response from forkserver after timeout seconds,
     we kill the child. The forkserver should inform us afterwards */
     s32 tmp_pid = fsrv->child_pid;
-    printf("kill main bin pid: %d\n", tmp_pid);
+    // printf("kill main bin pid: %d\n", tmp_pid);
     if (tmp_pid > 0) {
 
       // 还是fork server负责kill qemuafl fork出来的
+      printf("--------------------------------------------------------------------------------------[afl_fsrv_run_target] before kill %d\n", tmp_pid);
       kill(tmp_pid, fsrv->kill_signal);
+      printf("--------------------------------------------------------------------------------------[afl_fsrv_run_target] after kill %d\n", tmp_pid);
       fsrv->child_pid = -1;
     }
 
     fsrv->last_run_timed_out = 1;
-    // printf("[afl_fsrv_run_target] before read2\n");
-    printf("after main timeout, want to read from pipe %d\n", fsrv->fsrv_st_fd);
-    if (read(fsrv->fsrv_st_fd, &fsrv->child_status, 4) < 4) { exec_ms = 0; }
-    printf("after timeout, has read from pipe %d, exec_ms=%d\n", fsrv->fsrv_st_fd, exec_ms);
+  // printf("[afl_fsrv_run_target] before read2\n");
+    // printf("after main timeout, want to read from pipe %d\n", fsrv->fsrv_st_fd);
+    // if (read_len < 4) { exec_ms = 0; }
+    // printf("after timeout, has read from pipe %d, exec_ms=%d\n", fsrv->fsrv_st_fd, exec_ms);
 
   }else if(exec_ms > timeout && my_global_afl->utility_timeout > 0){
     // 只有子进程超时，但是已经kill了所有的子进程，所以其实不用管
     fsrv->last_run_timed_out = 1;
     ;
   }
+
+  printf("-----------------------------------[afl-fuzz]recv child status from forkserver before: %d\n", fsrv->child_status);
+  read_s32_timed(fsrv->fsrv_st_fd, &fsrv->child_status, 3000, stop_soon_p);
+  printf("-----------------------------------[afl-fuzz]recv child status from forkserver after: %d\n", fsrv->child_status);
    
 
 
@@ -3301,7 +3419,7 @@ afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
 
   /* Was the run unsuccessful? */
   if (unlikely(*(u32 *)fsrv->trace_bits == EXEC_FAIL_SIG)) {
-
+    printf("[afl_fsrv_run_target] return error\n");
     return FSRV_RUN_ERROR;
 
   }
@@ -3310,6 +3428,7 @@ afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
   if (unlikely(fsrv->last_run_timed_out)) {
 
     fsrv->last_kill_signal = fsrv->kill_signal;
+    printf("[afl_fsrv_run_target] return timeout\n");
     return FSRV_RUN_TMOUT;
 
   }
@@ -3368,11 +3487,13 @@ afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
     /* For a proper crash, set last_kill_signal to WTERMSIG, else set it to 0 */
     fsrv->last_kill_signal =
         WIFSIGNALED(fsrv->child_status) ? WTERMSIG(fsrv->child_status) : 0;
+    printf("[afl_fsrv_run_target] return crash\n");
     return FSRV_RUN_CRASH;
 
   }
 
   /* success :) */
+  printf("[afl_fsrv_run_target] return success\n");
   return FSRV_RUN_OK;
 
 }
