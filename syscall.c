@@ -64,6 +64,21 @@
 #include <linux/in6.h>
 #include <linux/errqueue.h>
 #include <linux/random.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/select.h>
+
+#define TIMEOUT_SEC 5  // 设置超时时间为 5 秒
+
+
 #ifdef CONFIG_TIMERFD
 #include <sys/timerfd.h>
 #endif
@@ -154,18 +169,6 @@ unsigned int hookhack_done = 0;
 char *qemu_execve_path;
 extern int fake_port;
 
-extern int packet_num;
-extern int remain_packet_num;
-extern json_t* packets_json;
-extern int packet_index;
-
-int current_http_index = 0;
-char *http_lines = NULL;
-size_t      sent_off   = 0;
-size_t      total_len  = 0;
-
-// int can_read = 1;
-
 int main_bin_accepted = 0;
 
 int http_fd = -1;
@@ -176,7 +179,7 @@ extern int bk_stdin_fd;
 extern int bk_stdout_fd;
 extern FILE *bk_stdin;
 extern FILE *bk_stdout;
-extern int forkserver_installed; //lbw
+
 
 // int exec_shmid = -1; // 若为-1则代表是正常启动，否则代表是由execve启动
 extern int serv_shmem_id;
@@ -984,46 +987,11 @@ abi_ulong afl_set_brk(abi_ulong new_brk) {
 }
 
 
-int inform_aflserver_raw(const char* msg)
-{
-    printf("[lbw] inform_aflserver_raw: 1\n");
-    int sockfd, len;
-    struct sockaddr_un addr;
-    /* 后面希望 afl-server 能也维护一份进程信息的副本，这样就不需要告知afl了。现在直接转发请求 */
-    char request_buf[0x30];
-    /* 请求消息格式 R|pid|pc */
-    /* 表示询问afl在ppid进程中的pc位置产生的fork内，是否已经产生过共享内存 */
-    /* 如果存在共享内存，返回共享内存id，否则返回-1 */
-    memset(request_buf, '\0', 0x30);
-    snprintf(request_buf, 0x30, "%s", msg);
-
-    if((sockfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1){
-        perror("inform_aflserver_exec: socket error\n");
-        return -1;
-    }
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCK_NAME, sizeof(addr.sun_path)-1);
-    len = sizeof(addr);
-    if (connect(sockfd, (struct sockaddr *)&addr, len) == -1) {
-            perror("inform_aflserver_exec: connect\n");
-            return -1;
-    }
-    if (send(sockfd, request_buf, strlen(request_buf), 0) == -1) {
-            perror("inform_aflserver_exec: send\n");
-            return -1;
-        }
-    /* 远程应当只返回一个shmem_id，或者是-1表示没有*/
-    /* atoi有一个麻烦的地方，如果处理错误返回为0*/
-    close(sockfd);
-    return 0;
-}
 
 
 
 int inform_aflserver_debug(const char* msg)
 {
-    printf("[lbw] inform_aflserver_debug: 1\n");
     int sockfd, len;
     struct sockaddr_un addr;
     /* 后面希望 afl-server 能也维护一份进程信息的副本，这样就不需要告知afl了。现在直接转发请求 */
@@ -1035,9 +1003,9 @@ int inform_aflserver_debug(const char* msg)
     snprintf(request_buf, 0x30, "D|%s", msg);
 
     if((sockfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1){
-        perror("inform_aflserver_exec: socket error\n");
-        return -1;
-    }
+    perror("inform_aflserver_exec: socket error\n");
+    return -1;
+  }
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, SOCK_NAME, sizeof(addr.sun_path)-1);
@@ -1058,7 +1026,6 @@ int inform_aflserver_debug(const char* msg)
 
 
 int inform_aflserver_debug_fmt(const char* format, ...){
-    printf("[lbw] inform_aflserver_debug_fmt: 1\n");
     va_list args;
     char debug_buf[0x30];
     memset(debug_buf, 0, 0x30);
@@ -1579,9 +1546,6 @@ static inline abi_long copy_to_user_mq_attr(abi_ulong target_mq_attr_addr,
     return 0;
 }
 #endif
-
-// bool can_close = true;
-
 extern pthread_mutex_t* global_shmem_mutex;
 #if defined(TARGET_NR_select) || defined(TARGET_NR__newselect)
 /* do_select() must return target values and target errnos. */
@@ -1595,11 +1559,15 @@ static abi_long do_select(int n,
     struct timespec ts, *ts_ptr;
     abi_long ret;
     bool hookhack_set_fd = false;
-    printf("[HOOK] select1\n");
+
     // 进入select的时候，释放锁。select有结果返回时(即有连接产生)，设置锁
     if(global_shmem_mutex != NULL){
         pthread_mutex_unlock(global_shmem_mutex);
     }
+    
+    // inform_aflserver_debug("[do_select] hit unlock\n");
+
+    // inform_aflserver_debug_fmt("pid: %d start select", getpid());
 
     ret = copy_from_user_fdset_ptr(&rfds, &rfds_ptr, rfd_addr, n);
     if (ret) {
@@ -1634,7 +1602,6 @@ static abi_long do_select(int n,
         
     }
 
-    printf("[HOOK] select2\n");
     if(hookhack && http_fd == -1) {
         fprintf(bk_stdout, "[HOOK] select invoked with nfd: %d\n", n);
         // fake select result:
@@ -1652,17 +1619,12 @@ static abi_long do_select(int n,
             port = ntohs(sin.sin_port);
             printf("port: %d\n", port);
             if(port != fake_port) continue;
-
-// packet_index = packet_index + 1;
-
-
             http_fd = i;
             fprintf(bk_stdout, "[HOOK] http_fd: %d\n", http_fd);
             hookhack_set_fd = true;
             break;
         }
     }
-    printf("[HOOK] select5\n");
 
     /* modified on 0722
     else if(hookhack && http_fd != -1 && hookhack_recved){
@@ -1680,15 +1642,11 @@ static abi_long do_select(int n,
         memset(&wfds, 0, sizeof(wfds));
         memset(&efds, 0, sizeof(efds));
     } else {
-        printf("[HOOK] select6\n");
-        // if(init_select == 0){
-            ret = get_errno(safe_pselect6(n, rfds_ptr, wfds_ptr, efds_ptr, ts_ptr, NULL));
-        // }
-        printf("[HOOK] select7\n");
+        ret = get_errno(safe_pselect6(n, rfds_ptr, wfds_ptr, efds_ptr,
+                                      ts_ptr, NULL));
     }
 
     // 当有新的fd可以读取时，设置锁。还是在accept中设置?
-    printf("[HOOK] select8\n");
     if(global_shmem_mutex != NULL){
         int trylock_result = pthread_mutex_trylock(global_shmem_mutex);
     }
@@ -1697,7 +1655,6 @@ static abi_long do_select(int n,
     if (!is_error(ret)) {
         if(hookhack && hookhack_set_fd) {
         // if(hookhack) {
-    printf("[HOOK] select9\n");
             fprintf(bk_stdout, "[HOOK] setting fd!\n");
             FD_SET(http_fd, &rfds);
             if(ret < http_fd+1) ret = http_fd+1;
@@ -1717,7 +1674,6 @@ static abi_long do_select(int n,
             }
         }
     }
-    printf("[HOOK] select10\n");
 
     return ret;
 }
@@ -3951,7 +3907,6 @@ static abi_long do_sendrecvmmsg(int fd, abi_ulong target_msgvec,
 }
 
 int inform_aflserver_bug(int shmid, target_ulong bug_addr){
-    printf("[lbw] inform_aflserver_bug: 1\n");
     int sockfd, len;
     struct sockaddr_un addr;
     char send_buf[0x20];
@@ -3988,7 +3943,6 @@ int inform_aflserver_bug(int shmid, target_ulong bug_addr){
 }
 
 int inform_aflserver_cmdinj(int shmid, target_ulong bug_addr){
-    printf("[lbw] inform_aflserver_cmdinj: 1\n");
     int sockfd, len;
     struct sockaddr_un addr;
     char send_buf[0x20];
@@ -4024,8 +3978,6 @@ int inform_aflserver_cmdinj(int shmid, target_ulong bug_addr){
 
 int inform_aflserver_hit(int shmid){
     // H|<pid> 告知产生了HIT事件，并且一轮结束
-    
-    printf("[lbw] inform_aflserver_hit: 1\n");
     int sockfd, len;
     struct sockaddr_un addr;
     char request_buf[0x20];
@@ -4057,7 +4009,7 @@ int inform_aflserver_hit(int shmid){
 
 /* do_accept4() Must return target values and target errnos. */
 bool gh_dryrun_done = false;
-// int  ipc_flag = 0;
+int  ipc_flag = 0;
 extern int global_shmid;
 
 static abi_long do_accept4(int fd, abi_ulong target_addr,
@@ -4080,47 +4032,31 @@ static abi_long do_accept4(int fd, abi_ulong target_addr,
 
     /* 多进程场景下，只需要主进程设置hookhack， 后台进程需要等到主进程连接 */
     /* 因此设置ipc_flag始终为0 */
-    printf("[lbw] do_accpet4:1\n");
     if(hookhack) {
         // inform_aflserver_debug("do accept, 1\n");
         struct sockaddr_in sin;
         socklen_t len = sizeof(sin);
         uint16_t port = 0;
-        // ipc_flag = 0;
+        ipc_flag = 0;
         // int new_fd = -1;
         if(conn_fd != -1) {
             fputs("[HOOK] deny subsequent accept calls!\n", bk_stdout);
             return -EAGAIN;
         }
 
+        fputs("[HOOK] accept hooked!\n", bk_stdout);
         if(getsockname(fd, (struct sockaddr *)&sin, &len)) goto out;
         port = ntohs(sin.sin_port);
-        printf("[HOOK] accept at port: %d\n", port);
+        fprintf(bk_stdout, "[HOOK] accept at port: %d\n", port);
         if(port != fake_port) goto out;
         if(hookhack_recved) {
             fputs("[HOOK] done!\n", bk_stdout);
             // exit(0);
         }
+        conn_fd = dup(bk_stdin_fd); // 在某些epoll_wait情况中，需要将返回的fd改为conn_fd，因为在accept之后可能会通过epoll_ctl直接监听这个accept的fd
+        fprintf(bk_stdout, "[HOOK] accept sock fd: %d\n", conn_fd);
 
-
-        char packet_name[20];
-        sprintf(packet_name, "packet_%d", packet_index);
-        json_t *packet_json = json_object_get(packets_json, packet_name);
-        char* packet = json_string_value(packet_json);
-        int sv[2];
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
-            perror("socketpair");
-            return -EINVAL;
-        }
-        size_t pktlen = strlen(packet);
-        write(sv[1], packet, pktlen);
-        close(sv[1]);
-        conn_fd = sv[0];
-        printf("[HOOK] fake conn fd=%d, payload len=%zu\n", conn_fd, pktlen);
-
-        remain_packet_num = remain_packet_num - 1;
-        packet_index = packet_index + 1;
-
+        // fake connection source
         if (get_user_u32(addrlen, target_addrlen_addr))
             return -TARGET_EFAULT;
         struct sockaddr_in saddr = {0};
@@ -4141,13 +4077,12 @@ out:
     // 不能用accept记录锁。例如发生了一次accept，之后再次等待连接的时候，可能不会回到这里，而是到select或者poll的地方
     // 因此应该在do_select的开头和结束设置锁
     // inform_aflserver_debug("do accept, 2\n");
-    printf("[lbw] do_accpet4:4\n");
-    if(remain_packet_num != 0){
+    if(ipc_flag == 1){
         /* 曾经发生了accept()并且回到了出发点 */
         /* 告知AFL发生过accept事件，并且已经执行完毕，可以读取共享内存 */
-        // ipc_flag = 0;
+        ipc_flag = 0;
         // pthread_mutex_unlock(global_shmem_mutex);
-        printf("[lbw] do_accpet4:5 informing_aflserver_hit\n");
+        
         inform_aflserver_hit(global_shmid);
         
     }
@@ -4184,7 +4119,7 @@ out:
     }
     /* 程序到达此处则可以判定有新连接，等待当前进程执行完毕之后发送HIT事件*/
     /* 一般而言程序不会结束，那么设置当到达同一位置，也就是重新开始accept()时，发送HIT信息 */
-    // ipc_flag = 1;
+    ipc_flag = 1;
     // 同时判断是否有锁，有的话就不处理，如果没有就加锁,pthread_mutex_trylock在有锁的时候不处理，没有锁的时候加锁
     // 有锁的时候: 首次创建，从afl_setup里面获取的锁
     // 没有锁的时候: 不是首次创建，处理完了一次用户请求之后
@@ -7244,10 +7179,9 @@ static int ask_aflserver_shmem_nonblock(pid_t pid, const char* name) {
     struct timeval tv;  
     char request_buf[0x30];  
     char reply_buf[0x30];  
-    printf("[ask_aflserver_shmem_nonblock] entering\n");
+  
     memset(request_buf, '\0', 0x30);  
-    snprintf(request_buf, 0x30, "R|%u|%s", (unsigned int)pid, name);
-    printf("[ask_aflserver_shmem_nonblock] pid %d sneding message : %s\n", (unsigned int)pid, request_buf);
+    snprintf(request_buf, 0x30, "R|%u|%s", (unsigned int)pid, name);  
   
     if ((sockfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {  
         perror("ask_aflserver_shmem: socket error");  
@@ -7283,14 +7217,13 @@ static int ask_aflserver_shmem_nonblock(pid_t pid, const char* name) {
     if (bytes_received == -1) {  
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT) {  
             // 超时或资源暂时不可用（尽管在UNIX域套接字中不常见）  
-            fprintf(stderr, "ask_aflserver_shmem: pid %d recv timeout or error\n", (unsigned int)pid);  
+            fprintf(stderr, "ask_aflserver_shmem: recv timeout or error\n");  
             exit(-1); // 直接退出程序  
         } else {  
             perror("ask_aflserver_shmem: recv error");  
             exit(-1); // 其他错误也直接退出  
         }  
     }  
-    printf("[ask_aflserver_shmem_nonblock] pid %d finish\n", (unsigned int)pid);
   
     close(sockfd);  
     int id = atoi(reply_buf);  
@@ -7299,7 +7232,6 @@ static int ask_aflserver_shmem_nonblock(pid_t pid, const char* name) {
 
 
 static int inform_aflserver_child(int pid, int shmid, char* name){
-    printf("[lbw] inform_aflserver_child: 1\n");
     int sockfd, len;
     struct sockaddr_un addr;
     char request_buf[0x20];
@@ -7354,7 +7286,7 @@ extern target_ulong global_cur_pc;
 extern pthread_mutex_t* read_or_create_named_shared_mutex(int shmid);
 extern int has_setup;
 extern char* gl_argv_0;
-pid_t* self_childs = NULL;
+// pid_t* self_childs = NULL;
 size_t self_child_cnt = 0;
 /* do_fork() Must return host values and target errnos (unlike most
    do_*() functions). */
@@ -7368,10 +7300,10 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
     CPUState *new_cpu;
     CPUArchState *new_env;
     sigset_t sigmask;
-    if(self_childs == NULL){
-        self_childs = (pid_t*)malloc(sizeof(pid_t)*0x20);
-        memset(self_childs, 0, sizeof(pid_t)*0x20);
-    }
+    // if(self_childs == NULL){
+    //     self_childs = (pid_t*)malloc(sizeof(pid_t)*0x20);
+    //     memset(self_childs, 0, sizeof(pid_t)*0x20);
+    // }
     //FILE* fp = fopen("/AFLplusplus/qemu_test/addr.txt" ,"a+");
     //fprintf(fp,"[FORK] inside fork\n");
 
@@ -7482,11 +7414,9 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         
 
         // fork_start定义在linux-user/main.c中
-        printf("[fork] start\n");
         fork_start();
         ret = fork();
         if (ret == 0) {
-            printf("[fork] after fork child\n");
             /* Child Process.  */
             // printf("after fork1\n");
 
@@ -7656,10 +7586,9 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         } else {
             // 父进程，就是什么都不修改,依然是AFL_MAIN_BIN,也就是主
             // 添加到本地维护的子进程pid列表
-            self_childs[self_child_cnt++]=ret;
+            // self_childs[self_child_cnt++]=ret;
             // usleep(5000); // 父进程sb
 
-            printf("[fork] after fork parent\n");
             cpu_clone_regs_parent(env, flags);
             fork_end(0);
         }
@@ -9242,7 +9171,6 @@ static int do_access(const char *pathname, int mode){
     // 如果是特定类型的，不访问
     if(strstr(pathname, "/lib/") ||
        strstr(pathname, "/proc") ||
-       strstr(pathname, "/usr/sbin") ||
         !strcmp(pathname, "/nvram_cow_lock") || 
         !strcmp(pathname, "/nvram_lock") || 
         !strcmp(pathname, "/nvram_shm") || 
@@ -9688,7 +9616,6 @@ uint32_t calc_crc32_of_file(const char *filename) {
 
 static int query_aflserver_shmid(uint32_t hashid)
 {
-    // can_close = false;
     int sockfd, len;
     struct sockaddr_un addr;
     /* 后面希望 afl-server 能也维护一份进程信息的副本，这样就不需要告知afl了。现在直接转发请求 */
@@ -9724,10 +9651,9 @@ static int query_aflserver_shmid(uint32_t hashid)
     /* atoi有一个麻烦的地方，如果处理错误返回为0*/
     close(sockfd);
     int id = atoi(reply_buf);
-    // can_close = true;
     return id;
 }
-static int query_aflserver_shmid_nonblock2(uint32_t hashid)  
+static int query_aflserver_shmid_nonblock(uint32_t hashid)  
 {  
     int sockfd, len;  
     struct sockaddr_un addr;  
@@ -9742,7 +9668,7 @@ static int query_aflserver_shmid_nonblock2(uint32_t hashid)
         perror("query_aflserver_shmid: socket error");  
         return -1;  
     }  
-  
+    printf("before 接收超时\n");
     // 设置接收超时  
     tv.tv_sec = 2;  // 1秒  
     tv.tv_usec = 0; // 0微秒  
@@ -9750,86 +9676,73 @@ static int query_aflserver_shmid_nonblock2(uint32_t hashid)
         perror("setsockopt");  
         close(sockfd);  
         return -1;  
-    }
-  
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;  
-    strncpy(addr.sun_path, SOCK_NAME, sizeof(addr.sun_path)-1);  
-    len = sizeof(addr);  
-    if (connect(sockfd, (struct sockaddr *)&addr, len) == -1) {  
-        perror("query_aflserver_shmid: connect");  
-        close(sockfd);  
-        return -1;  
     }  
-  
-    if (send(sockfd, request_buf, strlen(request_buf), 0) == -1) {  
-        perror("query_aflserver_shmid: send");  
-        close(sockfd);  
-        return -1;  
-    }  
-  
-    int bytes_received = recv(sockfd, reply_buf, 0x30, 0);  
-    if (bytes_received == -1) {  
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {  
-            // 超时发生  
-            fprintf(stderr, "query_aflserver_shmid: recv timeout\n");  
-        } else {  
-            perror("query_aflserver_shmid: recv error");  
-        }  
-        close(sockfd);  
-        exit(-1); // 直接退出程序  
-    }  
-  
-    close(sockfd);  
-    int id = atoi(reply_buf);  
-    return id;  
-}  
-
-static int query_aflserver_shmid_nonblock(uint32_t hashid)  
-{  
-    int sockfd, len;  
-    struct sockaddr_un addr;  
-    struct timeval tv;  
-    char request_buf[0x30];  
-    char reply_buf[0x30];  
-    // can_close = false;
-    
-    printf("[query_aflserver_shmid_nonblock] entering\n");
-
-    memset(request_buf, '\0', 0x30);
-    snprintf(request_buf, 0x30, "Q|%u|%d", hashid, getpid());  
-  
-    if ((sockfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {  
-        perror("query_aflserver_shmid: socket error");  
-        return -1;  
-    }  
-  
-    // 设置接收超时  
-    tv.tv_sec = 5;  // 2秒  
-    tv.tv_usec = 0; // 0微秒  
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv)) < 0) {  
-        perror("setsockopt");  
-        close(sockfd);  
-        return -1;  
-    }  
+    printf("after 接收超时\n");
   
     memset(&addr, 0, sizeof(addr));  
     addr.sun_family = AF_UNIX;  
     strncpy(addr.sun_path, SOCK_NAME, sizeof(addr.sun_path)-1);  
     len = sizeof(addr);  
+    // printf("before connect\n");
+    // 在 connect 前添加：
+
+    // 获取IP和端口
+    char ip[16];
+    struct sockaddr_in *s = (struct sockaddr_in *)&addr;
+    inet_ntop(AF_INET, &s->sin_addr, ip, sizeof(ip));
+    int port = ntohs(s->sin_port);
+
+    printf("Target: %s:%d\n", ip, port);
+    printf("DEBUG: Connecting to UNIX socket: %s\n", addr.sun_path);
     if (connect(sockfd, (struct sockaddr *)&addr, len) == -1) {  
         perror("query_aflserver_shmid: connect");  
         close(sockfd);  
         return -1;  
     }  
+    // hjr:
+    // struct timeval hjrtv;
+    // fd_set writefds;
+    // hjrtv.tv_sec = TIMEOUT_SEC;  // 设置超时
+    // hjrtv.tv_usec = 0;
+
+    // // 设置非阻塞模式
+    // fcntl(sockfd, F_SETFL, O_NONBLOCK);
+
+    // // 尝试连接
+    // if (connect(sockfd, (struct sockaddr *)&addr, len) == -1) {  
+    //     if (errno != EINPROGRESS) {  // 如果不是 EINPROGRESS，表示连接失败
+    //         perror("query_aflserver_shmid: connect");
+    //         close(sockfd);
+    //         return -2;  // 连接失败，返回 -1
+    //     }
+    // }
+
+    // // 初始化写文件描述符集合
+    // FD_ZERO(&writefds);
+    // FD_SET(sockfd, &writefds);
+
+    // // 使用 select 监视写事件
+    // int ret = select(sockfd + 1, NULL, &writefds, NULL, &hjrtv);
+
+    // if (ret == 0) {
+    //     // 超时
+    //     printf("connection timeout\n");
+    //     close(sockfd);
+    //     return -2;  // 连接超时，返回 -2
+    // } else if (ret < 0) {
+    //     // 错误
+    //     perror("query_aflserver_shmid: connect after select");
+    //     close(sockfd);
+    //     return -2;  // 出现错误，返回 -1
+    // }
+    printf("before 11111111111111\n");
   
     if (send(sockfd, request_buf, strlen(request_buf), 0) == -1) {  
         perror("query_aflserver_shmid: send");  
         close(sockfd);  
         return -1;  
     }  
-  
-    fprintf(stderr, "query_aflserver_shmid: request sent, waiting for reply\n");  
+    printf("before bytes_received\n");
   
     int bytes_received = recv(sockfd, reply_buf, 0x30, 0);  
     if (bytes_received == -1) {  
@@ -9845,17 +9758,15 @@ static int query_aflserver_shmid_nonblock(uint32_t hashid)
   
     close(sockfd);  
     int id = atoi(reply_buf);  
-    printf("[query_aflserver_shmid_nonblock] finish\n");
-    // can_close = true;
     return id;  
 }  
+
 
 
 
 
 static int inform_aflserver_exec(uint32_t hashid, int shmid, char* name)
 {
-    printf("[lbw] inform_aflserver_exec: 1\n");
     int sockfd, len;
     struct sockaddr_un addr;
     /* 后面希望 afl-server 能也维护一份进程信息的副本，这样就不需要告知afl了。现在直接转发请求 */
@@ -10159,21 +10070,25 @@ qemu_execve_cont:
         }
     }
 
-
+    printf("before i_name\n");
     // 询问是否产生过内存
     const char* i_name_dup = NULL;
     if(i_name){
         i_name_dup = strdup(i_name);
         // fprintf(bk_stdout, "[qemu_exeve] i_name != NULL, i_name=%s, i_name_dup = %s\n", i_name, i_name_dup);
+        printf("before real_path\n");
         free(real_path);
+        printf("after real_path\n");
         real_path = check_symlink_me(i_name);
         // fprintf(bk_stdout, "[qemu_exeve, 1] i_name != NULL, i_name=%s, i_name_dup = %s\n", i_name, i_name_dup);
     }
+    printf("before file_hash\n");
     uint32_t file_hash = calc_crc32_of_file(real_path);
+    printf("before query_aflserver_shmid\n");
     execved_shmid = query_aflserver_shmid_nonblock(file_hash);
     // fprintf(bk_stdout, "[qemu_exeve, 2] i_name = %s, i_name_dup = %s\n", i_name, i_name_dup);
     // fprintf(bk_stdout, "[qemu_execve] real path is %s\n", real_path);
-
+    printf("before execved_shmid\n");
     if(execved_shmid == -1){
         // inform_aflserver_debug("execved_shmid==-1\n");
         // Prost! New finding !
@@ -10215,8 +10130,6 @@ qemu_execve_cont:
     }
     // 如果不是-1说明曾经被创建，那么应当在query_aflserver_shmid时就被设置为HIT，从而减少一次通信
     // fprintf(exec_fp, "[qemu_execve] %s got execved_shmid %d\n", filename ,execved_shmid);
-    
-
 
     
     // fprintf(stderr, "[qemu] doing qemu_execven on filename %s\n", filename);
@@ -10232,6 +10145,7 @@ qemu_execve_cont:
     token = strtok(qemu_path_tokens, " ");
     qemu_path = strdup(token);
     token = strtok(NULL, " ");
+    printf("before token != Null while\n");
     while (token != NULL) {
         token = strtok(NULL, " ");
         tokCount += 1;
@@ -10376,7 +10290,7 @@ static bool wait_for_self_pid(pid_t child_pid){
         pid_t result = waitpid(child_pid, &status, WNOHANG);
         if (result == -1) {
             perror("waitpid");
-            return true;
+            exit(EXIT_FAILURE);
         } else if (result > 0) {
             if (WIFEXITED(status) || WIFSIGNALED(status)) {
                 return true;
@@ -10470,10 +10384,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         preexit_cleanup(cpu_env, arg1);
         _exit(arg1);
         return 0; /* avoid warning */
-    case TARGET_NR_read://leisheng
+    case TARGET_NR_read:
         fd = arg1;
-        fprintf(bk_stdout, "[HOOK] read invoked @ fd: %d, conn_fd: %d\n", fd, conn_fd);
         if(hookhack && conn_fd != -1 && fd == conn_fd) {
+            fprintf(bk_stdout, "[HOOK] read invoked @ fd: %d\n", fd);
             hookhack_recved = true;
         }
 
@@ -10489,69 +10403,6 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             }
             unlock_user(p, arg2, ret);
         }
-
-        // if (arg2 == 0 && arg3 == 0) {
-        //     return get_errno(safe_read(arg1, 0, 0));
-        // } else {
-        //     if (!(p = lock_user(VERIFY_WRITE, arg2, arg3, 0)))
-        //         return -TARGET_EFAULT;
-        //     if(fd == conn_fd && conn_fd != -1){
-        //         if(packet_index != current_http_index){
-        //             current_http_index = packet_index;
-        //             char packet_name[20];
-        //             sprintf(packet_name, "packet_%d", packet_index);
-        //             json_t *packet_json = json_object_get(packets_json, packet_name);
-        //             http_lines = json_string_value(packet_json);
-        //             total_len = strlen(http_lines);
-        //             sent_off  = 0;
-        //         }
-        //         printf("[HOOK] read2\n");
-        //         size_t give = 0;
-        //         char *next_nl = (char *)memchr(http_lines + sent_off, '\n', total_len - sent_off);
-        //         if (next_nl) {
-        //             give = next_nl - (http_lines + sent_off) + 1;   
-        //         } else {
-        //             give = total_len - sent_off;                    
-        //         }
-        //         if (give > arg3) give = arg3;
-        //         memcpy(p, http_lines + sent_off, give);
-        //         sent_off += give;
-        //         ret       = give;
-        //         fprintf(bk_stdout, "Read %ld bytes: ", ret);
-        //         for (int i = 0; i < ret; i++) {
-        //             fprintf(bk_stdout, "%c", ((unsigned char *)p)[i]);
-        //         }
-        //     }else{
-        //         ret = get_errno(safe_read(arg1, p, arg3));
-        //     }
-            // printf("[HOOK READ] read fd: %d, conn_fd: %d, read_len: %d\n", fd, conn_fd, ret);
-
-    //         if (ret > 0 && fd == conn_fd && conn_fd != -1) {
-    //             // 打印读取的内容和长度
-    //             printf("[HOOK READ] packet num: %d\n", packet_num);
-    //             printf("[HOOK READ] packet num remained: %d\n", remain_packet_num);
-    //             printf("[HOOK READ] packet index: %d\n", packet_index);
-    //             // 每次收到数据包都通知forkserver发下一个
-    // // inform_aflserver_raw("123");//leisheng
-    //             printf("[HOOK READ] recieved packet content\n");
-    //             fprintf(bk_stdout, "Read %ld bytes: ", ret);
-    //             for (int i = 0; i < ret; i++) {
-    //                 fprintf(bk_stdout, "%c", ((unsigned char *)p)[i]);
-    //             }
-    //             fprintf(bk_stdout, "\n");
-    //             conn_fd = -1;
-    //         }
-        // printf("[HOOK] read3\n");
-
-        //     if (ret >= 0 &&
-        //         fd_trans_host_to_target_data(arg1)) {
-        // printf("[HOOK] read3.1\n");
-        //         ret = fd_trans_host_to_target_data(arg1)(p, ret);
-        // printf("[HOOK] read3.2\n");
-        //     }
-        //     unlock_user(p, arg2, ret);
-        // }
-        printf("[HOOK] read finish\n");
         return ret;
     case TARGET_NR_write:
         fd = arg1;
@@ -10633,10 +10484,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             return 0;
         }
         
-        if(conn_fd >= 0 && arg1 == conn_fd) {//leisheng
+        if(conn_fd >=0 && arg1 == conn_fd) {
             
             if(getenv("AFL_MAIN_BIN") && strcmp(getenv("AFL_MAIN_BIN"), "1")==0){
-
+                
                 
                 fputs("[HOOK_close] close!", bk_stdout);
                 // // 这里有一个tricky的条件竞争
@@ -10648,35 +10499,15 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 // 9.4 为什么这种情况下afl-fuzz不会等待子进程结束
                 // FILE* close_fp = fopen("qemu_close.log", "a+");
                 // fprintf(close_fp, "[HOOK] close!, all_pid_cnt=%d\n", self_child_cnt);
+                // for(size_t cnt = 0; cnt < self_child_cnt; cnt++){
+                //         fprintf(close_fp, "[HOOK_close] wait for pid=%d\n",self_childs[cnt]);
+                //         while(wait_for_self_pid(self_childs[cnt]) == false){
+                //         ;
+                //     }
                 // }
                 // fclose(close_fp);
-                printf("[HOOK] close, remain_packet_num = %d\n", remain_packet_num);
-
-                if(remain_packet_num < 0){
-                    // while(can_close == false){
-                    //     ;
-                    // }
-                    printf("[HOOK] close, informing 124, pid = %d, start check child pid finish\n", getpid());
-                    for(size_t cnt = 0; cnt < self_child_cnt; cnt++){
-                        printf("[HOOK_close] wait for pid=%d\n",self_childs[cnt]);
-                        while(wait_for_self_pid(self_childs[cnt]) == false){
-                            printf("wait exit 123\n");
-                            ;
-                        }
-                        printf("[HOOK] close, informing 124, pid = %d, after check child pid finish\n", getpid());
-                    }
-            inform_aflserver_raw("124");//leisheng
-
-                    exit(0);
-                }
-                else{
-                    // printf("[HOOK] close, informing 123\n");
-    // inform_aflserver_raw("124");//leishen
-                    // can_read = 1;
-                    http_fd = -1;
-                    conn_fd = -1;
-                    return 0x00;
-                }
+                
+                exit(0);
             }
             // fprintf(close_fp, "[HOOK] close!, all_pid_cnt=%d, but not AFL_MAIN_BIN\n", self_child_cnt);
             // fclose(close_fp);
@@ -10880,7 +10711,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
              */
             // ret = get_errno(qemu_execve(p, argp, envp));
             
-            if (qemu_execve_path && *qemu_execve_path && forkserver_installed_extern != 0) {
+            if (qemu_execve_path && *qemu_execve_path && forkserver_installed_extern!=0) {
                 ret = get_errno(qemu_execve(p, argp, envp));
             }
             else {
@@ -11153,9 +10984,6 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return get_errno(syncfs(arg1));
 #endif
     case TARGET_NR_kill:
-        if(arg1 == 0 || arg1 == -1 || arg1 == 1){
-            return;
-        }
         return get_errno(safe_kill(arg1, target_to_host_signal(arg2)));
 #ifdef TARGET_NR_rename
     case TARGET_NR_rename:
@@ -12586,26 +12414,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_semget
     case TARGET_NR_semget:
-        ;
-        int flags = 0666 | IPC_CREAT | IPC_EXCL; // 包含 IPC_CREAT 和 IPC_EXCL
-        int return_value = semget(arg1, arg2, flags);
-        if (return_value == -1) {
-            if (errno == EEXIST) {
-                // 信号量已存在，移除 IPC_EXCL 标志重新尝试
-                flags = 0666 | IPC_CREAT;
-                return_value = semget(arg1, arg2, flags);
-                if (return_value == -1) {
-                    fprintf(bk_stdout, "[qemu semget] Error: %s\n", strerror(errno)); // 打印错误信息
-                }
-            } else {
-                fprintf(bk_stdout, "[qemu semget] Error: %s\n", strerror(errno)); // 打印错误信息
-            }
-        }
-        fprintf(bk_stdout, "[qemu semget] arg1 %d arg2 %d arg3 %d\n", arg1, arg2, flags); // lbw
-        if (return_value != -1) {
-            fprintf(bk_stdout, "[qemu semget] return %d\n", return_value); // lbw
-        }
-        return get_errno(return_value);
+        return get_errno(semget(arg1, arg2, arg3));
 #endif
 #ifdef TARGET_NR_semop
     case TARGET_NR_semop:
@@ -14746,9 +14555,6 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 
     case TARGET_NR_tkill:
-        if(arg1 == 0 || arg1 == -1 || arg1 == 1){
-            return;
-        }
         return get_errno(safe_tkill((int)arg1, target_to_host_signal(arg2)));
 
     case TARGET_NR_tgkill:
